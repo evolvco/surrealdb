@@ -9,9 +9,10 @@ use std::time::Duration;
 use async_channel::Sender;
 use futures::StreamExt;
 use reblessive::TreeStack;
-use tikv::{CdcClient, CdcEvent, CdcOptions, RowChange, RowOp};
+use tikv::{CdcClient, CdcConfig, CdcEvent, CdcOptions, RowChange, RowOp};
 use tokio::task::JoinHandle;
 
+use super::cnf::{TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE, TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE};
 use crate::dbs::{Action, Notification};
 use crate::doc::process_cdc_event;
 use crate::err::Error;
@@ -87,9 +88,28 @@ impl CdcConsumer {
 	async fn run_inner(&self) -> Result<(), Error> {
 		info!(target: TARGET, "Connecting to TiKV CDC at {}", self.pd_endpoint);
 
-		let cdc = CdcClient::new(vec![self.pd_endpoint.clone()])
-			.await
-			.map_err(|e| Error::Ds(format!("Failed to create CDC client: {}", e)))?;
+		let max_decoding = *TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE;
+		let max_encoding = *TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE;
+		info!(
+			target: TARGET,
+			"CDC gRPC limits: max_decoding={} bytes ({}), max_encoding={} bytes ({})",
+			max_decoding,
+			if max_decoding == 0 { "unlimited".to_string() } else { format!("{}MB", max_decoding / 1024 / 1024) },
+			max_encoding,
+			if max_encoding == 0 { "unlimited".to_string() } else { format!("{}MB", max_encoding / 1024 / 1024) }
+		);
+
+		let cdc_config = CdcConfig::default()
+			.with_max_decoding_message_size(max_decoding)
+			.with_max_encoding_message_size(max_encoding);
+
+		let cdc = CdcClient::new_with_cdc_config(
+			vec![self.pd_endpoint.clone()],
+			tikv::Config::default(),
+			cdc_config,
+		)
+		.await
+		.map_err(|e| Error::Ds(format!("Failed to create CDC client: {}", e)))?;
 
 		info!(target: TARGET, "CDC client connected, subscribing to all changes");
 
