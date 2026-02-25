@@ -5,11 +5,11 @@ mod cnf;
 
 use crate::err::Error;
 use crate::key::debug::Sprintable;
+use crate::kvs::savepoint::{SaveOperation, SavePointImpl, SavePoints, SavePrepare};
 use crate::kvs::Check;
 use crate::kvs::Key;
 use crate::kvs::KeyEncode;
 use crate::kvs::Val;
-use crate::kvs::savepoint::{SaveOperation, SavePointImpl, SavePoints, SavePrepare};
 use crate::vs::VersionStamp;
 use std::fmt::Debug;
 use std::ops::Range;
@@ -87,6 +87,19 @@ impl Datastore {
 		};
 		// Set the default request timeout
 		let config = config.with_timeout(Duration::from_secs(*cnf::TIKV_REQUEST_TIMEOUT));
+		// Set gRPC message size limits
+		let config = config
+			.with_grpc_max_decoding_message_size(*cnf::TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE)
+			.with_grpc_max_encoding_message_size(*cnf::TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE);
+		// Log gRPC limits for debugging
+		info!(
+			target: TARGET,
+			"gRPC limits: max_decoding={} bytes ({}), max_encoding={} bytes ({})",
+			*cnf::TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE,
+			if *cnf::TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE == 0 { "unlimited".to_string() } else { format!("{}MB", *cnf::TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE / 1024 / 1024) },
+			*cnf::TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE,
+			if *cnf::TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE == 0 { "unlimited".to_string() } else { format!("{}MB", *cnf::TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE / 1024 / 1024) }
+		);
 		// Create the client with the config
 		let client = TransactionClient::new_with_config(vec![path], config);
 		// Check for errors with the client
