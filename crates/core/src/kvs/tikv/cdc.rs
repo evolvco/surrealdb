@@ -75,6 +75,12 @@ impl CdcConsumer {
 					break;
 				}
 				Err(e) => {
+					let msg = e.to_string();
+					// If we were connected but got a region error, reset backoff
+					// (region errors happen during normal operation, not connection issues)
+					if msg.contains("CDC region error") {
+						backoff = INITIAL_BACKOFF;
+					}
 					warn!(target: TARGET, "CDC consumer error: {}. Reconnecting in {:?}", e, backoff);
 					tokio::time::sleep(backoff).await;
 					// Exponential backoff with max
@@ -143,7 +149,35 @@ impl CdcConsumer {
 					region_id,
 					error,
 				}) => {
-					warn!(target: TARGET, "CDC error for region {}: {}", region_id, error);
+					use tikv::CdcError;
+					match &error {
+						// These errors mean the subscription is stale and needs to reconnect
+						CdcError::EpochNotMatch
+						| CdcError::NotLeader {
+							..
+						}
+						| CdcError::RegionNotFound => {
+							warn!(target: TARGET, "CDC error for region {} requires reconnect: {}", region_id, error);
+							return Err(Error::Ds(format!("CDC region error: {}", error)));
+						}
+						// These are transient or ignorable
+						CdcError::DuplicateRequest | CdcError::ServerIsBusy => {
+							debug!(target: TARGET, "CDC transient error for region {}: {}", region_id, error);
+						}
+						// These are fatal configuration errors
+						CdcError::ClusterIdMismatch {
+							..
+						}
+						| CdcError::Compatibility {
+							..
+						} => {
+							error!(target: TARGET, "CDC fatal error for region {}: {}", region_id, error);
+							return Err(Error::Ds(format!("CDC fatal error: {}", error)));
+						}
+						CdcError::Other(msg) => {
+							warn!(target: TARGET, "CDC unknown error for region {}: {}", region_id, msg);
+						}
+					}
 				}
 				Ok(CdcEvent::Admin {
 					region_id,
