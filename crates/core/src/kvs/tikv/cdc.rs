@@ -3,6 +3,7 @@
 //! This module provides a background task that subscribes to TiKV's CDC stream
 //! and sends LIVE SELECT notifications for any matching live queries.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +38,7 @@ pub struct CdcConsumer {
 	pd_endpoint: String,
 	sender: Sender<Notification>,
 	transaction_factory: TransactionFactory,
+	last_resolved_ts: AtomicU64,
 }
 
 impl CdcConsumer {
@@ -50,6 +52,7 @@ impl CdcConsumer {
 			pd_endpoint,
 			sender,
 			transaction_factory,
+			last_resolved_ts: AtomicU64::new(0),
 		}
 	}
 
@@ -70,20 +73,16 @@ impl CdcConsumer {
 		loop {
 			match self.run_inner().await {
 				Ok(()) => {
-					// Clean shutdown requested
 					info!(target: TARGET, "CDC consumer shutting down");
 					break;
 				}
 				Err(e) => {
 					let msg = e.to_string();
-					// If we were connected but got a region error, reset backoff
-					// (region errors happen during normal operation, not connection issues)
 					if msg.contains("CDC region error") {
 						backoff = INITIAL_BACKOFF;
 					}
 					warn!(target: TARGET, "CDC consumer error: {}. Reconnecting in {:?}", e, backoff);
 					tokio::time::sleep(backoff).await;
-					// Exponential backoff with max
 					backoff = (backoff * 2).min(MAX_BACKOFF);
 				}
 			}
@@ -92,7 +91,9 @@ impl CdcConsumer {
 
 	/// Inner run loop - returns Err on disconnection to trigger reconnect.
 	async fn run_inner(&self) -> Result<(), Error> {
-		info!(target: TARGET, "Connecting to TiKV CDC at {}", self.pd_endpoint);
+		let checkpoint = self.last_resolved_ts.load(Ordering::Relaxed);
+
+		info!(target: TARGET, "Connecting to TiKV CDC at {} (checkpoint_ts={})", self.pd_endpoint, checkpoint);
 
 		let max_decoding = *TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE;
 		let max_encoding = *TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE;
@@ -119,14 +120,14 @@ impl CdcConsumer {
 
 		info!(target: TARGET, "CDC client connected, subscribing to all changes");
 
+		let options = CdcOptions::default().with_checkpoint_ts(checkpoint);
 		let mut stream = cdc
-			.subscribe_all(CdcOptions::default())
+			.subscribe_all(options)
 			.await
 			.map_err(|e| Error::Ds(format!("Failed to subscribe to CDC: {}", e)))?;
 
 		info!(target: TARGET, "CDC subscription active, waiting for events");
 
-		// Reset backoff on successful connection
 		while let Some(event) = stream.next().await {
 			match event {
 				Ok(CdcEvent::Rows {
@@ -141,9 +142,10 @@ impl CdcConsumer {
 					}
 				}
 				Ok(CdcEvent::ResolvedTs {
+					ts,
 					..
 				}) => {
-					// Skip logging resolved timestamps - they're very frequent
+					self.last_resolved_ts.store(ts, Ordering::Relaxed);
 				}
 				Ok(CdcEvent::Error {
 					region_id,
@@ -151,20 +153,16 @@ impl CdcConsumer {
 				}) => {
 					use tikv::CdcError;
 					match &error {
-						// These errors mean the subscription is stale and needs to reconnect
 						CdcError::EpochNotMatch
 						| CdcError::NotLeader {
 							..
 						}
-						| CdcError::RegionNotFound => {
+						| CdcError::RegionNotFound
+						| CdcError::DuplicateRequest
+						| CdcError::ServerIsBusy => {
 							warn!(target: TARGET, "CDC error for region {} requires reconnect: {}", region_id, error);
 							return Err(Error::Ds(format!("CDC region error: {}", error)));
 						}
-						// These are transient or ignorable
-						CdcError::DuplicateRequest | CdcError::ServerIsBusy => {
-							debug!(target: TARGET, "CDC transient error for region {}: {}", region_id, error);
-						}
-						// These are fatal configuration errors
 						CdcError::ClusterIdMismatch {
 							..
 						}
@@ -176,6 +174,7 @@ impl CdcConsumer {
 						}
 						CdcError::Other(msg) => {
 							warn!(target: TARGET, "CDC unknown error for region {}: {}", region_id, msg);
+							return Err(Error::Ds(format!("CDC region error: {}", error)));
 						}
 					}
 				}
@@ -190,18 +189,15 @@ impl CdcConsumer {
 			}
 		}
 
-		// Stream ended unexpectedly
 		Err(Error::Ds("CDC stream ended unexpectedly".into()))
 	}
 
 	/// Process a single row change from CDC.
 	async fn process_row(&self, row: RowChange) -> Result<(), Error> {
-		// Try to decode as a record key, skip if not a record
 		let key_bytes: Vec<u8> = row.key.into();
 		let thing_key = match ThingKey::decode(&key_bytes) {
 			Ok(k) => k,
 			Err(_) => {
-				// Not a record key (could be index, metadata, etc.) - skip silently
 				return Ok(());
 			}
 		};
@@ -211,7 +207,6 @@ impl CdcConsumer {
 		let tb = thing_key.tb;
 		let id = thing_key.id;
 
-		// Determine action from operation type
 		let action = match row.op {
 			RowOp::Put => {
 				if row.old_value.is_some() {
@@ -224,8 +219,6 @@ impl CdcConsumer {
 			RowOp::Unknown => return Ok(()),
 		};
 
-		// Skip CDC events with no value for Create/Update
-		// (these are internal bookkeeping like reference keys, not actual record data)
 		if matches!(action, Action::Create | Action::Update) && row.value.is_none() {
 			trace!(target: TARGET, "Skipping {:?} with no value for {}.{}.{}:{:?}", action, ns, db, tb, id);
 			return Ok(());
@@ -233,7 +226,6 @@ impl CdcConsumer {
 
 		trace!(target: TARGET, "Processing {:?} on {}.{}.{}:{:?}", action, ns, db, tb, id);
 
-		// Decode the document values
 		let current: Value = if let Some(ref val) = row.value {
 			revision::from_slice(val).unwrap_or(Value::None)
 		} else {
@@ -246,17 +238,14 @@ impl CdcConsumer {
 			Value::None
 		};
 
-		// Build the record Thing
 		let record = Thing::from((tb.to_string(), id));
 
-		// Create a read transaction for the live query processing
 		let tx = Arc::new(
 			self.transaction_factory
 				.transaction(TransactionType::Read, LockType::Optimistic)
 				.await?,
 		);
 
-		// Process the CDC event using the shared live query logic
 		let mut stack = TreeStack::new();
 		stack
 			.enter(|stk| {

@@ -8,6 +8,7 @@ use std::fmt;
 /// ChangeFeedInclude statements are an appendix
 #[non_exhaustive]
 #[derive(Default)]
+#[allow(dead_code)]
 pub enum ChangeFeedInclude {
 	#[default]
 	Original,

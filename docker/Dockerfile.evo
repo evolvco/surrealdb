@@ -7,7 +7,7 @@ FROM docker.io/rockylinux/rockylinux:9 AS builder
 
 RUN dnf install -y gcc-toolset-13 git cmake llvm-toolset patch zlib-devel python3.11
 
-ARG RUST_VERSION=1.88.0
+ARG RUST_VERSION=stable
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > /tmp/rustup.sh \
     && bash /tmp/rustup.sh -y --default-toolchain ${RUST_VERSION}
 ENV PATH="/root/.cargo/bin:${PATH}"
@@ -22,7 +22,7 @@ COPY docker docker
 
 # Build release binary
 RUN . /opt/rh/gcc-toolset-13/enable && \
-    RUSTFLAGS="-D warnings --cfg tokio_unstable" \
+    RUSTFLAGS="--cfg tokio_unstable" \
     cargo build --release --locked \
         --no-default-features --features "storage-mem,storage-rocksdb,storage-surrealkv,storage-tikv,scripting,http,jwks"
 

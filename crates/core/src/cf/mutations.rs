@@ -201,6 +201,7 @@ impl Display for ChangeSet {
 pub struct WriteMutationSet(pub Vec<TableMutations>);
 
 impl WriteMutationSet {
+	#[allow(dead_code)]
 	pub fn new() -> Self {
 		Self(Vec::new())
 	}
