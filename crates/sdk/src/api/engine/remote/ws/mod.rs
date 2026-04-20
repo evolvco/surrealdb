@@ -24,6 +24,9 @@ use uuid::Uuid;
 
 pub(crate) const PATH: &str = "rpc";
 const PING_INTERVAL: Duration = Duration::from_secs(5);
+/// Maximum time to wait for any response from the server before considering the connection dead.
+/// This catches half-open TCP connections where writes succeed but the server never responds.
+const MAX_WAIT_FOR_RESPONSE: Duration = Duration::from_secs(15);
 const REVISION_HEADER: &str = "revision";
 
 enum RequestEffect {

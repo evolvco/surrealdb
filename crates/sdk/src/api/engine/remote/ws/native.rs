@@ -4,7 +4,7 @@ use crate::api::conn::Router;
 use crate::api::conn::{Command, DbResponse};
 use crate::api::conn::{Connection, RequestData};
 use crate::api::engine::remote::ws::Client;
-use crate::api::engine::remote::ws::PING_INTERVAL;
+use crate::api::engine::remote::ws::{MAX_WAIT_FOR_RESPONSE, PING_INTERVAL};
 use crate::api::engine::remote::Response;
 use crate::api::engine::remote::{deserialize, serialize};
 use crate::api::err::Error;
@@ -565,7 +565,21 @@ pub(crate) async fn run_router(
 					}
 				}
 				_ = pinger.next() => {
-					// only ping if we haven't talked to the server recently
+					// If the server hasn't sent us anything in MAX_WAIT_FOR_RESPONSE,
+					// the connection is effectively dead (half-open TCP). Reconnect.
+					if state.last_activity.elapsed() >= MAX_WAIT_FOR_RESPONSE {
+						warn!("Server silent for {:?}, reconnecting", state.last_activity.elapsed());
+						router_reconnect(
+							&maybe_connector,
+							&config,
+							&mut state,
+							&endpoint,
+						)
+						.await;
+						continue 'router;
+					}
+
+					// Only ping if we haven't talked to the server recently
 					if state.last_activity.elapsed() >= PING_INTERVAL {
 						trace!("Pinging the server");
 						if let Err(error) = state.sink.send(ping.clone()).await {
@@ -580,7 +594,6 @@ pub(crate) async fn run_router(
 							continue 'router;
 						}
 					}
-
 				}
 			}
 		}
