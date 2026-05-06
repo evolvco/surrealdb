@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+mod cdc;
 pub mod client_ip;
 mod export;
 mod gql;
@@ -182,6 +183,7 @@ pub async fn init(ds: Arc<Datastore>, ct: CancellationToken) -> Result<(), Error
 		.merge(key::router())
 		.merge(ml::router())
 		.merge(api::router())
+		.merge(cdc::router())
 		.merge(gql::router(ds.clone()).await);
 
 	if ds.get_capabilities().allows_experimental(&ExperimentalTarget::GraphQL) {

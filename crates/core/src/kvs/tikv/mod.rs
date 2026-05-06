@@ -1,6 +1,5 @@
 #![cfg(feature = "kv-tikv")]
 
-pub mod cdc;
 mod cnf;
 
 use crate::err::Error;
@@ -24,8 +23,6 @@ const TARGET: &str = "surrealdb::core::kvs::tikv";
 
 pub struct Datastore {
 	db: Pin<Arc<TransactionClient>>,
-	/// The PD endpoint for CDC subscription
-	pd_endpoint: String,
 }
 
 pub struct Transaction {
@@ -106,15 +103,9 @@ impl Datastore {
 		match client.await {
 			Ok(db) => Ok(Datastore {
 				db: Arc::pin(db),
-				pd_endpoint: path.to_string(),
 			}),
 			Err(e) => Err(Error::Ds(e.to_string())),
 		}
-	}
-
-	/// Get the PD endpoint for CDC subscription
-	pub(crate) fn pd_endpoint(&self) -> &str {
-		&self.pd_endpoint
 	}
 
 	/// Shutdown the database

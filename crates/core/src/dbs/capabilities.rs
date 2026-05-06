@@ -372,6 +372,7 @@ pub enum RouteTarget {
 	Ml,
 	GraphQL,
 	Api,
+	CdcIngest,
 }
 
 // impl display
@@ -391,6 +392,7 @@ impl fmt::Display for RouteTarget {
 			RouteTarget::Ml => write!(f, "ml"),
 			RouteTarget::GraphQL => write!(f, "graphql"),
 			RouteTarget::Api => write!(f, "api"),
+			RouteTarget::CdcIngest => write!(f, "cdc_ingest"),
 		}
 	}
 }
@@ -429,6 +431,7 @@ impl std::str::FromStr for RouteTarget {
 			"ml" => Ok(RouteTarget::Ml),
 			"graphql" => Ok(RouteTarget::GraphQL),
 			"api" => Ok(RouteTarget::Api),
+			"cdc_ingest" => Ok(RouteTarget::CdcIngest),
 			_ => Err(ParseRouteTargetError),
 		}
 	}

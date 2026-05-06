@@ -1,6 +1,4 @@
 use super::export;
-#[cfg(feature = "kv-tikv")]
-use super::tikv::cdc::{CdcConsumer, CdcHandle};
 use super::tr::Transactor;
 use super::tx::Transaction;
 use super::version::Version;
@@ -12,8 +10,11 @@ use crate::dbs::capabilities::{
 };
 use crate::dbs::node::Timestamp;
 use crate::dbs::{
-	Attach, Capabilities, Executor, Notification, Options, Response, Session, Variables,
+	Action as DbsAction, Attach, Capabilities, Executor, Notification, Options, Response, Session,
+	Variables,
 };
+use crate::doc::process_cdc_event;
+use crate::key::thing::Thing as ThingKey;
 use crate::err::Error;
 #[cfg(feature = "jwks")]
 use crate::iam::jwks::JwksCache;
@@ -28,8 +29,8 @@ use crate::kvs::clock::SystemClock;
 use crate::kvs::index::IndexBuilder;
 use crate::kvs::slowlog::SlowLog;
 use crate::kvs::tasklease::{LeaseHandler, TaskLeaseType};
-use crate::kvs::{LockType, LockType::*, TransactionType, TransactionType::*};
-use crate::sql::{Base, Index, Query, Value, statements::DefineUserStatement};
+use crate::kvs::{KeyDecode, LockType, LockType::*, TransactionType, TransactionType::*};
+use crate::sql::{Base, Index, Query, Thing, Value, statements::DefineUserStatement};
 use crate::syn;
 use crate::syn::parser::{ParserSettings, StatementStream};
 use crate::{cf, cnf};
@@ -95,9 +96,6 @@ pub struct Datastore {
 	#[cfg(storage)]
 	// The temporary directory
 	temporary_directory: Option<Arc<PathBuf>>,
-	#[cfg(feature = "kv-tikv")]
-	// The CDC consumer handle for TiKV LIVE SELECT support
-	cdc_handle: Option<CdcHandle>,
 }
 
 #[derive(Clone)]
@@ -243,6 +241,16 @@ impl fmt::Display for Datastore {
 			_ => unreachable!(),
 		}
 	}
+}
+
+/// Opcode for a row change dispatched through [`Datastore::process_cdc_row`].
+///
+/// Mirrors the TiKV CDC opcode vocabulary without coupling the public
+/// surface to any particular upstream type.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CdcRowOp {
+	Put,
+	Delete,
 }
 
 impl Datastore {
@@ -452,8 +460,6 @@ impl Datastore {
 				#[cfg(storage)]
 				temporary_directory: None,
 				cache: Arc::new(DatastoreCache::new()),
-				#[cfg(feature = "kv-tikv")]
-				cdc_handle: None,
 			}
 		})
 	}
@@ -499,8 +505,6 @@ impl Datastore {
 			temporary_directory: self.temporary_directory,
 			transaction_factory: self.transaction_factory,
 			cache: Arc::new(DatastoreCache::new()),
-			#[cfg(feature = "kv-tikv")]
-			cdc_handle: self.cdc_handle,
 		}
 	}
 
@@ -519,17 +523,6 @@ impl Datastore {
 	/// Specify whether this datastore should enable live query notifications
 	pub fn with_notifications(mut self) -> Self {
 		self.notification_channel = Some(async_channel::bounded(LQ_CHANNEL_SIZE));
-
-		// Start CDC consumer for TiKV to enable distributed LIVE SELECT
-		#[cfg(feature = "kv-tikv")]
-		if let DatastoreFlavor::TiKV(ref tikv_ds) = self.transaction_factory.flavor.as_ref() {
-			let pd_endpoint = tikv_ds.pd_endpoint().to_string();
-			let sender = self.notification_channel.as_ref().unwrap().0.clone();
-			let tf = self.transaction_factory.clone();
-			let consumer = CdcConsumer::new(pd_endpoint, sender, tf);
-			self.cdc_handle = Some(consumer.spawn());
-		}
-
 		self
 	}
 
@@ -1325,6 +1318,78 @@ impl Datastore {
 	#[instrument(level = "debug", target = "surrealdb::core::kvs::ds", skip_all)]
 	pub fn notifications(&self) -> Option<Receiver<Notification>> {
 		self.notification_channel.as_ref().map(|v| v.1.clone())
+	}
+
+	/// Dispatch a raw CDC (Change Data Capture) row change into the
+	/// live-query notification pipeline.
+	///
+	/// This is the public entry point used by the `/cdc/ingest` HTTP route
+	/// (fed by the external Go connector reading from TiCDC). The caller
+	/// provides the raw TiKV key/value bytes and the opcode; this method
+	/// handles thing-key decoding, revision-format deserialisation, action
+	/// derivation, and dispatch through `doc::process_cdc_event`.
+	///
+	/// Keys that don't decode as record-thing keys (e.g. live-query keys or
+	/// other internal structures) are silently skipped. If the datastore has
+	/// no notification channel configured (i.e. `.with_notifications()` was
+	/// never called) this is a no-op.
+	#[instrument(level = "debug", target = "surrealdb::core::kvs::ds", skip_all)]
+	pub async fn process_cdc_row(
+		&self,
+		op: CdcRowOp,
+		key: &[u8],
+		value: Option<&[u8]>,
+		old_value: Option<&[u8]>,
+	) -> Result<(), Error> {
+		let Some((sender, _)) = self.notification_channel.as_ref() else {
+			return Ok(());
+		};
+		// Only record-thing keys are relevant for live queries; non-thing
+		// keys (schema, live-query metadata, etc.) are safely skipped.
+		let Ok(thing_key) = ThingKey::decode(key) else {
+			return Ok(());
+		};
+		let action = match op {
+			CdcRowOp::Put => {
+				if old_value.is_some() {
+					DbsAction::Update
+				} else {
+					DbsAction::Create
+				}
+			}
+			CdcRowOp::Delete => DbsAction::Delete,
+		};
+		if matches!(action, DbsAction::Create | DbsAction::Update) && value.is_none() {
+			return Ok(());
+		}
+		let current = match value {
+			Some(v) => revision::from_slice(v).unwrap_or(Value::None),
+			None => Value::None,
+		};
+		let initial = match old_value {
+			Some(v) => revision::from_slice(v).unwrap_or(Value::None),
+			None => Value::None,
+		};
+		let record = Thing::from((thing_key.tb.to_string(), thing_key.id.clone()));
+		let tx = Arc::new(self.transaction_factory.transaction(Read, Optimistic).await?);
+		let mut stack = TreeStack::new();
+		stack
+			.enter(|stk| {
+				process_cdc_event(
+					stk,
+					tx,
+					sender,
+					thing_key.ns,
+					thing_key.db,
+					thing_key.tb,
+					record,
+					action,
+					initial,
+					current,
+				)
+			})
+			.finish()
+			.await
 	}
 
 	/// Performs a database import from SQL

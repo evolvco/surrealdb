@@ -58,6 +58,7 @@ pub(crate) use key::impl_key;
 pub use key::{KeyDecode, KeyDecodeOwned, KeyEncode};
 
 pub use ds::Datastore;
+pub use ds::CdcRowOp;
 pub use live::Live;
 pub use tr::{Check, LockType, TransactionType, Transactor};
 pub use tx::Transaction;
