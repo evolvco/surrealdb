@@ -84,10 +84,21 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("CDC_SURREAL_PASSWORD is required")
 	}
 
-	// Key range is optional. An empty start/end subscribes to everything,
-	// which is the intended production setting.
-	cfg.StartKey = []byte(os.Getenv("CDC_START_KEY"))
-	cfg.EndKey = []byte(os.Getenv("CDC_END_KEY"))
+	// Key range defaults: empty StartKey = beginning of key space,
+	// EndKey = 0xFF covers all SurrealDB data keys (which start with
+	// 0x2F = '/') while excluding TiKV internal sentinel regions above
+	// 0xFF. These raw bytes get memcomparable-encoded in
+	// installSubscription() before being passed to the logpuller.
+	if v := os.Getenv("CDC_START_KEY"); v != "" {
+		cfg.StartKey = []byte(v)
+	} else {
+		cfg.StartKey = []byte{}
+	}
+	if v := os.Getenv("CDC_END_KEY"); v != "" {
+		cfg.EndKey = []byte(v)
+	} else {
+		cfg.EndKey = []byte{0xFF}
+	}
 
 	if v := os.Getenv("CDC_HEARTBEAT_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)

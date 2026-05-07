@@ -42,7 +42,7 @@ where
 /// Wire envelope. One of `row_change`, `resolved_ts`, `heartbeat` is
 /// populated based on `type`.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 enum CdcMessage {
 	RowChange(RowChange),
@@ -189,13 +189,8 @@ async fn dispatch(db: &Datastore, msg: CdcMessage) -> Result<(), Error> {
 				.await
 				.map_err(Error::from)?;
 		}
-		CdcMessage::ResolvedTs(_) => {
-			// Resolved-ts watermarks are not yet consumed by SurrealDB; the
-			// connector still emits them so the ingest path can adopt them
-			// later without a wire-format change.
-		}
+		CdcMessage::ResolvedTs(_) => {}
 		CdcMessage::Heartbeat(_) => {
-			// Liveness ping; nothing to do beyond the trace below.
 			trace!("cdc ingest heartbeat");
 		}
 	}

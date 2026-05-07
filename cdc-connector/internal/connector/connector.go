@@ -17,7 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sync/atomic"
+	"strings"
 	"time"
 
 	"github.com/pingcap/log"
@@ -30,7 +30,9 @@ import (
 	"github.com/pingcap/ticdc/pkg/keyspace"
 	"github.com/pingcap/ticdc/pkg/pdutil"
 	"github.com/pingcap/ticdc/pkg/security"
+	"github.com/pingcap/ticdc/pkg/version"
 	"github.com/tikv/client-go/v2/tikv"
+	"github.com/tikv/client-go/v2/util/codec"
 	pd "github.com/tikv/pd/client"
 	"go.uber.org/zap"
 
@@ -57,9 +59,8 @@ type Connector struct {
 	subClient    logpuller.SubscriptionClient
 	pdClient     pd.Client
 	subID        logpuller.SubscriptionID
-	events       chan *wire.Message
-	httpClient   *http.Client
-	droppedCount atomic.Uint64
+	events     chan *wire.Message
+	httpClient *http.Client
 }
 
 // New constructs a Connector but does not start any goroutines. Call Run
@@ -131,9 +132,12 @@ func (c *Connector) Run(ctx context.Context) error {
 // NewSubscriptionClient (or NewLockerResolver) is called because those
 // consumers read them back via appcontext.GetService[T]().
 func (c *Connector) bootstrap(ctx context.Context) error {
+	// TiKV's CDC module requires a valid semver TiCDC version in the gRPC
+	// request header. Without it, TiKV suppresses resolved-ts events for
+	// the downstream. We impersonate a compatible TiCDC version.
+	version.ReleaseVersion = "v8.5.7"
+
 	// TiCDC reads a global server config via config.GetGlobalServerConfig()
-	// in several paths (keyspace storage creation, dynamic stream limits,
-	// etc.). Install a default config so those lookups succeed.
 	ticdcconfig.StoreGlobalServerConfig(ticdcconfig.GetDefaultServerConfig())
 
 	// PD client — the entry point to the TiKV cluster topology.
@@ -153,17 +157,27 @@ func (c *Connector) bootstrap(ctx context.Context) error {
 	appcontext.SetService(appcontext.RegionCache, regionCache)
 
 	// PD clock — monotonic time source reconciled with PD. Also looked
-	// up via appcontext.
+	// up via appcontext. Must call Run() to keep the clock updated;
+	// without it the logpuller's event loop stalls.
 	pdClock, err := pdutil.NewClock(ctx, pdClient)
 	if err != nil {
 		return fmt.Errorf("new pd clock: %w", err)
 	}
+	pdClock.Run(ctx)
 	appcontext.SetService(appcontext.DefaultPDClock, pdClock)
 
 	// Keyspace manager — required by the lock resolver to find which TiKV
 	// storage handle to use when scanning locks. In classic (single-
-	// keyspace) mode this resolves to keyspace 0.
-	ksManager := keyspace.NewManager(c.cfg.PDEndpoints)
+	// keyspace) mode this resolves to keyspace 0. Requires http:// prefix.
+	pdEndpointsWithScheme := make([]string, len(c.cfg.PDEndpoints))
+	for i, ep := range c.cfg.PDEndpoints {
+		if !strings.HasPrefix(ep, "http://") && !strings.HasPrefix(ep, "https://") {
+			pdEndpointsWithScheme[i] = "http://" + ep
+		} else {
+			pdEndpointsWithScheme[i] = ep
+		}
+	}
+	ksManager := keyspace.NewManager(pdEndpointsWithScheme)
 	appcontext.SetService(appcontext.KeyspaceManager, ksManager)
 
 	// Lock resolver — cleans up stale txn locks. Takes no arguments;
@@ -188,31 +202,40 @@ func (c *Connector) bootstrap(ctx context.Context) error {
 func (c *Connector) installSubscription() {
 	c.subID = c.subClient.AllocSubscriptionID()
 
+	// Keys must be memcomparable-encoded to match the format used by PD
+	// and TiKV's CDC module. Raw bytes won't work — TiKV rejects them
+	// and refuses to advance resolved-ts for the downstream.
+	startKey := codec.EncodeBytes(nil, c.cfg.StartKey)
+	endKey := codec.EncodeBytes(nil, c.cfg.EndKey)
+
 	span := heartbeatpb.TableSpan{
 		TableID:  syntheticTableID,
-		StartKey: c.cfg.StartKey,
-		EndKey:   c.cfg.EndKey,
+		StartKey: startKey,
+		EndKey:   endKey,
 	}
 
-	// startTs 0 means "start from the current cluster ts". We don't
-	// currently persist a resumption checkpoint across restarts; see the
-	// TDD for the future-work note on this.
-	var startTs uint64 = 0
-
-	// advanceInterval is how often the logpuller calls our
-	// advanceResolvedTs callback, in milliseconds. 1s matches the
-	// historical SurrealDB CDC cadence.
-	var advanceIntervalMs int64 = 1000
-
-	// bdrMode = false: we are not running in bidirectional replication
-	// mode, so we don't need the "filter out events we produced
-	// ourselves" logic.
-	const bdrMode = false
+	// Get the current cluster timestamp from PD. Subscribing at ts=0
+	// would mean "from the beginning of time" which is before GC and
+	// causes the range-lock to never converge. We subscribe from "now"
+	// so we only see changes going forward.
+	physical, logical, err := c.pdClient.GetTS(context.Background())
+	if err != nil {
+		log.Warn("failed to get start ts from PD, using 0", zap.Error(err))
+		physical, logical = 0, 0
+	}
+	var startTs uint64
+	if physical > 0 {
+		startTs = uint64(physical)<<18 | uint64(logical)
+	}
 
 	log.Info("installing subscription",
 		zap.Uint64("subscription_id", uint64(c.subID)),
+		zap.Uint64("start_ts", startTs),
 		zap.Binary("start_key", c.cfg.StartKey),
 		zap.Binary("end_key", c.cfg.EndKey))
+
+	var advanceIntervalMs int64 = 1000
+	const bdrMode = false
 
 	c.subClient.Subscribe(
 		c.subID,
@@ -229,20 +252,18 @@ func (c *Connector) installSubscription() {
 // batch of decoded KV entries.
 //
 // Return value convention (from the logpuller contract):
-//   - true: batch accepted, keep sending.
-//   - false: backpressure engaged; the logpuller will stop pushing until
+//   - false: batch consumed synchronously, keep sending.
+//   - true: batch accepted asynchronously; logpuller pauses until
 //     wakeCallback is invoked.
 //
-// We currently accept every batch and rely on the bounded channel to
-// backpressure: if the channel is full we still return true but drop the
-// oldest events (tracked in droppedCount). A richer implementation could
-// return false and wake when the channel drains, but that requires
-// holding wakeCallback across goroutines; deferred as future work.
+// We use a blocking channel send to apply natural backpressure: if
+// SurrealDB can't keep up, the channel fills, this callback blocks,
+// which blocks the logpuller's event handler, which propagates
+// backpressure all the way to TiKV. No events are dropped.
 func (c *Connector) consumeKVEvents(entries []common.RawKVEntry, wakeCallback func()) bool {
 	for i := range entries {
 		e := &entries[i]
 		msg := &wire.Message{
-			Type: wire.MessageTypeRowChange,
 			RowChange: &wire.RowChange{
 				SubscriptionID: uint64(c.subID),
 				Op:             mapOpType(e.OpType),
@@ -254,32 +275,21 @@ func (c *Connector) consumeKVEvents(entries []common.RawKVEntry, wakeCallback fu
 				RegionID:       e.RegionID,
 			},
 		}
-		select {
-		case c.events <- msg:
-		default:
-			// Channel full; drop. This should be rare in practice; if
-			// it becomes common, switch to the wakeCallback pattern.
-			c.droppedCount.Add(1)
-		}
+		c.events <- msg
 	}
 	_ = wakeCallback
-	return true
+	return false
 }
 
 // advanceResolvedTs is invoked when the logpuller's watermark advances.
 func (c *Connector) advanceResolvedTs(ts uint64) {
 	msg := &wire.Message{
-		Type: wire.MessageTypeResolvedTs,
 		ResolvedTs: &wire.ResolvedTs{
 			SubscriptionID: uint64(c.subID),
 			Ts:             ts,
 		},
 	}
-	select {
-	case c.events <- msg:
-	default:
-		c.droppedCount.Add(1)
-	}
+	c.events <- msg
 }
 
 func mapOpType(op common.OpType) wire.OpType {
@@ -313,8 +323,7 @@ func (c *Connector) forwarderLoop(ctx context.Context) error {
 		if err != nil {
 			log.Warn("ingest stream ended; reconnecting",
 				zap.Duration("backoff", backoff),
-				zap.Error(err),
-				zap.Uint64("dropped", c.droppedCount.Load()))
+				zap.Error(err))
 		}
 
 		select {
@@ -399,7 +408,6 @@ func (c *Connector) pumpFrames(ctx context.Context, pw io.Writer, heartbeats *ti
 			}
 		case <-heartbeats.C:
 			hb := &wire.Message{
-				Type: wire.MessageTypeHeartbeat,
 				Heartbeat: &wire.Heartbeat{
 					EmittedAt: time.Now().UnixMicro(),
 				},

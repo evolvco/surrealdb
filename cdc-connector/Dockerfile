@@ -13,8 +13,12 @@ RUN go mod download
 COPY . .
 
 # Static binary: CGO off, stripped symbols.
+# GOMAXPROCS=1 during build limits the compiler's memory footprint; the
+# TiDB-transitively dependency graph is large enough to OOM the default
+# Docker build sandbox otherwise.
 ENV CGO_ENABLED=0
-RUN go build -ldflags="-s -w" -o /out/cdc-connector ./cmd/cdc-connector
+ENV GOMAXPROCS=1
+RUN go build -ldflags="-s -w" -p 1 -o /out/cdc-connector ./cmd/cdc-connector
 
 # Runtime stage
 FROM gcr.io/distroless/static-debian12:nonroot

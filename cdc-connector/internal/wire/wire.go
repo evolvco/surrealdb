@@ -20,15 +20,6 @@ import (
 	"github.com/fxamacker/cbor/v2"
 )
 
-// MessageType discriminates the kinds of frames sent over the wire.
-type MessageType string
-
-const (
-	MessageTypeRowChange  MessageType = "row_change"
-	MessageTypeResolvedTs MessageType = "resolved_ts"
-	MessageTypeHeartbeat  MessageType = "heartbeat"
-)
-
 // OpType mirrors common.OpType from TiCDC. Kept as a separate enum so we do
 // not leak TiCDC types into the wire format: the Rust side has no dependency
 // on TiCDC.
@@ -46,7 +37,6 @@ const (
 // the Type field. CBOR omits omitempty fields, so on-the-wire each frame
 // carries only the relevant payload.
 type Message struct {
-	Type       MessageType `cbor:"type"`
 	RowChange  *RowChange  `cbor:"row_change,omitempty"`
 	ResolvedTs *ResolvedTs `cbor:"resolved_ts,omitempty"`
 	Heartbeat  *Heartbeat  `cbor:"heartbeat,omitempty"`
