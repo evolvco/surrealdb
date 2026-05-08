@@ -98,7 +98,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ vars.OPS_AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.OPS_AWS_REGION }}.amazonaws.com/cdc-connector
+          images: ${{ vars.OPS_AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.OPS_AWS_REGION }}.amazonaws.com/evo-cdc-connector
           flavor: |
             latest=false
           tags: |
