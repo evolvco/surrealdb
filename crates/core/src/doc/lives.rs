@@ -105,6 +105,7 @@ impl Document {
 				ns,
 				db,
 				ctx.value("session"),
+				Some(opt),
 			)
 			.await?;
 		}
@@ -127,6 +128,7 @@ impl Document {
 		ns: &str,
 		db: &str,
 		source_session: Option<&Value>,
+		parent_opt: Option<&Options>,
 	) -> Result<(), Error> {
 		// Ensure that a session exists on the LIVE query
 		let sess = match lv.session.as_ref() {
@@ -169,11 +171,14 @@ impl Document {
 		let lqctx = lqctx.freeze();
 
 		// Create options with auth from the live query
-		let lqopt = Options::new()
-			.with_ns(Some(ns.into()))
-			.with_db(Some(db.into()))
-			.with_perms(true)
-			.with_auth(Arc::from(auth));
+		let lqopt = match parent_opt {
+			Some(opt) => opt.new_with_perms(true).with_auth(Arc::from(auth)),
+			None => Options::new()
+				.with_ns(Some(ns.into()))
+				.with_db(Some(db.into()))
+				.with_perms(true)
+				.with_auth(Arc::from(auth)),
+		};
 
 		// Get the document to check against based on action
 		let doc = match (self.check_reduction_required(&lqopt)?, action == Action::Delete) {
@@ -393,6 +398,7 @@ pub async fn process_cdc_event(
 			ns,
 			db,
 			None, // CDC events don't have source session - TiKV only stores data, not SurrealDB session metadata
+			None, // CDC path has no parent Options - uses fresh Options with default auth_enabled
 		)
 		.await?;
 	}
